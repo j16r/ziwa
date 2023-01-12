@@ -1,0 +1,28 @@
+[package]
+name = "ziwa"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+actix-rt = "*"
+actix-service = "*"
+actix-server = "*"
+actix-utils = "*"
+
+bytes = "*"
+
+clap = "*"
+
+env_logger = "*"
+
+futures-core = { version = "*", default-features = false, features = ["alloc"] }
+futures-util = { version = "*", default-features = false, features = ["alloc"] }
+mio = { version = "*", features = ["os-poll", "net"] }
+num_cpus = "*"
+socket2 = "*"
+tokio = { version = "*", features = ["io-util", "sync", "rt-multi-thread", "macros", "fs"] }
+tokio-uring = { version = "0.4", optional = true }
+
+tracing = "*"
+tracing-subscriber = "*"
