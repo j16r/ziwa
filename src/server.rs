@@ -5,8 +5,10 @@ use actix_server::Server;
 use actix_service::{fn_service, ServiceFactoryExt as _};
 use bytes::BytesMut;
 use futures_util::future::ok;
+use postcard::from_bytes;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tracing::{debug, error, info};
+
+use crate::rpc::Command;
 
 pub async fn run() -> io::Result<()> {
     let addr = ("127.0.0.1", 34982);
@@ -44,9 +46,10 @@ pub async fn run() -> io::Result<()> {
                 }
             })
             .map_err(|err| tracing::error!("service error: {:?}", err))
-            .and_then(move |(_, size)| {
-                // let num = num2.load(Ordering::SeqCst);
-                // tracing::info!("[{}] total bytes read: {}", num, size);
+            .and_then(move |(bytes, size)| {
+                let command: Command = from_bytes(&(bytes as bytes::Bytes)[..]).unwrap();
+                tracing::trace!("got command {:?}", command);
+
                 ok(size)
             })
         })?

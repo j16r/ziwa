@@ -1,23 +1,20 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use clap::{Arg, Command};
-use tracing::{debug, error, info};
+use clap::{arg, Arg, Command};
 
+mod rpc;
+mod client;
 mod server;
 
-struct Lake {
-}
+struct Lake {}
 
 impl Lake {
-    fn add(&mut self, file: &Path) {
-    }
-
-
+    fn add(&mut self, file: &Path) {}
 }
 
 struct Job {
-    input: File
+    input: File,
 }
 
 struct File {
@@ -36,10 +33,7 @@ async fn main() -> io::Result<()> {
         .subcommand(
             Command::new("server")
                 .about("Server commands")
-                .subcommand(
-                    Command::new("run")
-                        .about("Run the server")
-                )
+                .subcommand(Command::new("run").about("Run the server")),
         )
         .subcommand(
             Command::new("files")
@@ -47,10 +41,8 @@ async fn main() -> io::Result<()> {
                 .subcommand(
                     Command::new("add")
                         .about("Add files to the lake")
-                        .arg(
-                            Arg::new("file")
-                        )
-                )
+                        .arg(arg!(<PATH> "path where file or files live"))
+                ),
         )
         .get_matches();
 
@@ -60,6 +52,8 @@ async fn main() -> io::Result<()> {
         }
     } else if let Some(subcommand) = matches.subcommand_matches("files") {
         if let Some(subcommand) = subcommand.subcommand_matches("add") {
+            let path = subcommand.get_one::<String>("PATH").unwrap();
+            client::add(Path::new(path)).await?;
         }
     }
 

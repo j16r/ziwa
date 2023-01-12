@@ -20,9 +20,14 @@ futures-core = { version = "*", default-features = false, features = ["alloc"] }
 futures-util = { version = "*", default-features = false, features = ["alloc"] }
 mio = { version = "*", features = ["os-poll", "net"] }
 num_cpus = "*"
+serde = "*"
 socket2 = "*"
 tokio = { version = "*", features = ["io-util", "sync", "rt-multi-thread", "macros", "fs"] }
 tokio-uring = { version = "0.4", optional = true }
 
 tracing = "*"
 tracing-subscriber = "*"
+
+[dependencies.postcard]
+version = "1"
+features = ["alloc"]
