@@ -5,6 +5,7 @@ edition = "2021"
 license = "LGPL-3.0-or-later"
 
 [dependencies]
+actix = "*"
 actix-rt = "*"
 actix-service = "*"
 actix-server = "*"
@@ -27,6 +28,8 @@ tokio-uring = { version = "0.4", optional = true }
 
 tracing = "*"
 tracing-subscriber = "*"
+
+walkdir = "*"
 
 [dependencies.postcard]
 version = "1"
