@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{arg, Arg, Command};
 
-mod rpc;
 mod client;
+mod rpc;
 mod server;
 
 struct Lake {}
@@ -41,7 +41,7 @@ async fn main() -> io::Result<()> {
                 .subcommand(
                     Command::new("add")
                         .about("Add files to the lake")
-                        .arg(arg!(<PATH> "path where file or files live"))
+                        .arg(arg!(<PATH> "path where file or files live")),
                 ),
         )
         .get_matches();

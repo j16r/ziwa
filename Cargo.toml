@@ -26,6 +26,10 @@ socket2 = "*"
 tokio = { version = "*", features = ["io-util", "sync", "rt-multi-thread", "macros", "fs"] }
 tokio-uring = { version = "0.4", optional = true }
 
+rayon = "*"
+
+surrealdb = "1.0.0-beta.8"
+
 tracing = "*"
 tracing-subscriber = "*"
 
