@@ -33,6 +33,8 @@ surrealdb = "1.0.0-beta.8"
 tracing = "*"
 tracing-subscriber = "*"
 
+ulid = "*"
+
 walkdir = "*"
 
 [dependencies.postcard]

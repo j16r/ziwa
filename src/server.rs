@@ -11,6 +11,7 @@ use postcard::{from_bytes, to_allocvec};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use surrealdb::Datastore;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use ulid::Ulid;
 use walkdir::WalkDir;
 
 use crate::rpc::{Command, Response};
@@ -31,7 +32,7 @@ async fn spawn_worker(
     let ds = ds.lock().unwrap();
     let mut tx = ds.transaction(true, false).await.unwrap();
     let bytes = to_allocvec(&command).unwrap();
-    tx.put("job1", bytes).await.unwrap();
+    tx.put(format!("jobs:{}", Ulid::new()), bytes).await.unwrap();
     tx.commit().await.unwrap();
 
     thread_pool.lock().unwrap().install(worker);
