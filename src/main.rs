@@ -1,3 +1,5 @@
+#![feature(async_closure)]
+
 use std::io;
 use std::path::{Path, PathBuf};
 

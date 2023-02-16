@@ -1,4 +1,4 @@
-use std::io::{self, Cursor};
+use std::io::{self, BufRead, BufReader, Cursor};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,6 +10,7 @@ use bytes::BytesMut;
 use postcard::{from_bytes, to_allocvec};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use surrealdb::Datastore;
+use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use ulid::Ulid;
 use walkdir::WalkDir;
@@ -17,25 +18,24 @@ use walkdir::WalkDir;
 use crate::rpc::{Command, Response};
 
 async fn spawn_worker(
-    ds: Arc<Mutex<Datastore>>,
+    ds: Arc<Datastore>,
     thread_pool: Arc<Mutex<ThreadPool>>,
     command: &Command,
 ) -> io::Result<()> {
+    let worker_ds = ds.clone();
     let worker_command = command.clone();
-    let worker = move || {
-        tracing::trace!("worker...");
-        work(&worker_command);
-    };
 
-    let thread_pool = thread_pool.clone();
-
-    let ds = ds.lock().unwrap();
     let mut tx = ds.transaction(true, false).await.unwrap();
     let bytes = to_allocvec(&command).unwrap();
-    tx.put(format!("jobs:{}", Ulid::new()), bytes).await.unwrap();
+    tx.put(format!("jobs:{}", Ulid::new()), bytes)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
-    thread_pool.lock().unwrap().install(worker);
+    tokio::spawn(async move {
+        tracing::trace!("worker...");
+        work(worker_ds, &worker_command).await;
+    });
 
     Ok(())
 }
@@ -44,7 +44,7 @@ pub async fn run() -> io::Result<()> {
     let addr = ("127.0.0.1", 34982);
     tracing::info!("starting server on port: {}", &addr.0);
 
-    let ds = Arc::new(Mutex::new(Datastore::new("memory").await.unwrap()));
+    let ds = Arc::new(Datastore::new("memory").await.unwrap());
     let thread_pool = Arc::new(Mutex::new(ThreadPoolBuilder::new().build().unwrap()));
 
     Server::build()
@@ -61,7 +61,7 @@ pub async fn run() -> io::Result<()> {
                     match stream.read_exact(&mut len_input).await {
                         Ok(bytes_read) => {
                             tracing::trace!("read bytes {:?}", bytes_read);
-                        },
+                        }
                         Err(err) => {
                             tracing::error!("stream error: {:?}", err);
                             return Err(());
@@ -73,7 +73,7 @@ pub async fn run() -> io::Result<()> {
                     match stream.read_exact(&mut bytes).await {
                         Ok(bytes_read) => {
                             tracing::trace!("read bytes {:?}", bytes_read);
-                        },
+                        }
                         Err(err) => {
                             tracing::error!("stream error: {:?}", err);
                             return Err(());
@@ -86,17 +86,13 @@ pub async fn run() -> io::Result<()> {
                     tracing::trace!("got command {:?}", command);
 
                     let response = match spawn_worker(ds, thread_pool, &command).await {
-                        Ok(()) => {
-                            Response::Ok
-                        },
-                        Err(_) => {
-                            Response::Error
-                        }
+                        Ok(()) => Response::Ok,
+                        Err(_) => Response::Error,
                     };
 
                     let mut output = Cursor::new(to_allocvec(&response).unwrap());
                     stream.write_buf(&mut output).await.unwrap();
-                    
+
                     Ok(())
                 }
             })
@@ -106,17 +102,17 @@ pub async fn run() -> io::Result<()> {
         .await
 }
 
-pub fn work(command: &Command) {
+pub async fn work(ds: Arc<Datastore>, command: &Command) {
     tracing::info!("sarting worker on {:?}", &command);
 
     let result = match command {
         Command::ShutDown => {
             unimplemented!();
         }
-        Command::FilesAdd(path) => add_path(path),
+        Command::FilesAdd(path) => add_path(ds, path),
     };
 
-    match result {
+    match result.await {
         Ok(()) => {
             tracing::info!("worker completed");
         }
@@ -126,7 +122,7 @@ pub fn work(command: &Command) {
     }
 }
 
-pub fn add_path(path: &Path) -> io::Result<()> {
+pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
     tracing::trace!("add_path processing ...");
     let mut walker = WalkDir::new(path).into_iter();
     loop {
@@ -137,6 +133,16 @@ pub fn add_path(path: &Path) -> io::Result<()> {
             }
 
             tracing::trace!("adding {:?}", entry);
+
+            let mut tx = ds.transaction(true, false).await.unwrap();
+            let command = Command::FilesAdd(entry.path().to_path_buf());
+            let bytes = to_allocvec(&command).unwrap();
+            tx.put(format!("jobs:{}", Ulid::new()), bytes)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+
+            fetch_file(path).await?;
         } else {
             break;
         }
@@ -145,8 +151,16 @@ pub fn add_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn fetch_file(path: &Path) -> io::Result<()> {
+pub async fn fetch_file(path: &Path) -> io::Result<()> {
     tracing::trace!("fetch_file processing ...");
+
+    let mut file = File::open(path).await?;
+
+    let chunk = 1024;
+    let mut buffer = vec![0; chunk];
+    while let Ok(n) = file.read(&mut buffer).await {
+        tracing::trace!("read n bytes {:?}", n);
+    }
 
     Ok(())
 }

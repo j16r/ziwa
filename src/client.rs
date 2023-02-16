@@ -1,10 +1,10 @@
 use std::io;
-use std::path::Path;
 use std::mem;
+use std::path::Path;
 
 use actix_rt::net::TcpStream;
 use bytes::BytesMut;
-use postcard::{to_allocvec, from_bytes};
+use postcard::{from_bytes, to_allocvec};
 
 use crate::rpc::{Command, Response};
 
