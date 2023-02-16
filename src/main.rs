@@ -1,9 +1,9 @@
 #![feature(async_closure)]
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Path};
 
-use clap::{arg, Arg, Command};
+use clap::{arg, Command};
 
 mod client;
 mod rpc;
@@ -12,7 +12,7 @@ mod server;
 struct Lake {}
 
 impl Lake {
-    fn add(&mut self, file: &Path) {}
+    fn add(&mut self, _file: &Path) {}
 }
 
 struct Job {
@@ -49,7 +49,7 @@ async fn main() -> io::Result<()> {
         .get_matches();
 
     if let Some(subcommand) = matches.subcommand_matches("server") {
-        if let Some(subcommand) = subcommand.subcommand_matches("run") {
+        if let Some(_subcommand) = subcommand.subcommand_matches("run") {
             server::run().await?;
         }
     } else if let Some(subcommand) = matches.subcommand_matches("files") {

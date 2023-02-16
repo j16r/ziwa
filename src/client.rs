@@ -1,5 +1,5 @@
 use std::io;
-use std::mem;
+
 use std::path::Path;
 
 use actix_rt::net::TcpStream;

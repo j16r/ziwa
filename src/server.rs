@@ -1,12 +1,11 @@
-use std::io::{self, BufRead, BufReader, Cursor};
-use std::mem;
-use std::path::{Path, PathBuf};
+use std::io::{self, Cursor};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use actix_rt::net::TcpStream;
 use actix_server::Server;
 use actix_service::{fn_service, ServiceFactoryExt as _};
-use bytes::BytesMut;
+
 use postcard::{from_bytes, to_allocvec};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use surrealdb::Datastore;
@@ -19,7 +18,7 @@ use crate::rpc::{Command, Response};
 
 async fn spawn_worker(
     ds: Arc<Datastore>,
-    thread_pool: Arc<Mutex<ThreadPool>>,
+    _thread_pool: Arc<Mutex<ThreadPool>>,
     command: &Command,
 ) -> io::Result<()> {
     let worker_ds = ds.clone();
@@ -124,28 +123,23 @@ pub async fn work(ds: Arc<Datastore>, command: &Command) {
 
 pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
     tracing::trace!("add_path processing ...");
-    let mut walker = WalkDir::new(path).into_iter();
-    loop {
-        if let Some(entry) = walker.next() {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            tracing::trace!("adding {:?}", entry);
-
-            let mut tx = ds.transaction(true, false).await.unwrap();
-            let command = Command::FilesAdd(entry.path().to_path_buf());
-            let bytes = to_allocvec(&command).unwrap();
-            tx.put(format!("jobs:{}", Ulid::new()), bytes)
-                .await
-                .unwrap();
-            tx.commit().await.unwrap();
-
-            fetch_file(path).await?;
-        } else {
-            break;
+    for entry in WalkDir::new(path).into_iter() {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
         }
+
+        tracing::trace!("adding {:?}", entry);
+
+        let mut tx = ds.transaction(true, false).await.unwrap();
+        let command = Command::FilesAdd(entry.path().to_path_buf());
+        let bytes = to_allocvec(&command).unwrap();
+        tx.put(format!("jobs:{}", Ulid::new()), bytes)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        fetch_file(path).await?;
     }
 
     Ok(())
