@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 use actix_rt::net::TcpStream;
 use actix_server::Server;
 use actix_service::{fn_service, ServiceFactoryExt as _};
-
+use awscreds::Credentials;
+use awsregion::Region;
 use postcard::{from_bytes, to_allocvec};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use s3::{Bucket, BucketConfiguration};
+use s3::error::S3Error;
 use surrealdb::Datastore;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -97,12 +100,13 @@ pub async fn run() -> io::Result<()> {
             })
             .map_err(|err| tracing::error!("service error: {:?}", err))
         })?
+        .workers(1)
         .run()
         .await
 }
 
 pub async fn work(ds: Arc<Datastore>, command: &Command) {
-    tracing::info!("sarting worker on {:?}", &command);
+    tracing::info!("starting worker on {:?}", &command);
 
     let result = match command {
         Command::ShutDown => {
@@ -139,22 +143,40 @@ pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
             .unwrap();
         tx.commit().await.unwrap();
 
-        fetch_file(path).await?;
+        fetch_file(entry.path()).await?;
     }
 
     Ok(())
 }
 
 pub async fn fetch_file(path: &Path) -> io::Result<()> {
-    tracing::trace!("fetch_file processing ...");
+    tracing::trace!("fetch_file processing {}", path.display());
+
+    // let status_code = Bucket::create(
+    //     "blobs",
+    //     Region::Custom {
+    //         region: Region::EuWest2.to_string(),
+    //         endpoint: "http://localhost:9000".to_owned(),
+    //     },
+    //     Credentials::new(Some("ziwa"), Some("ziwadevpass"), None, None, None).unwrap(),
+    //     BucketConfiguration::default(),
+    // ).await.unwrap();
+    
+    // tracing::trace!("status from bucket create {:?}", status_code.response_text);
+    
+    let bucket = Bucket::new(
+        "blobs",
+        Region::Custom {
+            region: Region::EuWest2.to_string(),
+            endpoint: "http://localhost:9000".to_owned(),
+        },
+        Credentials::new(Some("ziwa"), Some("ziwadevpass"), None, None, None).unwrap(),
+    ).unwrap()
+    .with_path_style();
 
     let mut file = File::open(path).await?;
-
-    let chunk = 1024;
-    let mut buffer = vec![0; chunk];
-    while let Ok(n) = file.read(&mut buffer).await {
-        tracing::trace!("read n bytes {:?}", n);
-    }
+    let status_code = bucket.put_object_stream(&mut file, path.to_str().unwrap()).await.unwrap();
+    tracing::trace!("status from bucket write {:?}", status_code);
 
     Ok(())
 }
