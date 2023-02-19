@@ -26,6 +26,8 @@ socket2 = "*"
 tokio = { version = "*", features = ["io-util", "sync", "rt-multi-thread", "macros", "fs"] }
 tokio-uring = { version = "0.4", optional = true }
 
+mime-sniffer = "0.1.2"
+
 aws-creds = "*"
 aws-region = "*"
 rust-s3 = "*"
@@ -34,10 +36,12 @@ rayon = "*"
 
 surrealdb = "1.0.0-beta.8"
 
+time = "0.3"
+
 tracing = "*"
 tracing-subscriber = "*"
 
-ulid = "*"
+ulid = { version = "*", features = ["serde"] }
 
 walkdir = "*"
 

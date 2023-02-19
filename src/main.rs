@@ -1,27 +1,13 @@
 #![feature(async_closure)]
 
 use std::io;
-use std::path::{Path};
+use std::path::Path;
 
 use clap::{arg, Command};
 
 mod client;
 mod rpc;
 mod server;
-
-struct Lake {}
-
-impl Lake {
-    fn add(&mut self, _file: &Path) {}
-}
-
-struct Job {
-    input: File,
-}
-
-struct File {
-    path: Path,
-}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {

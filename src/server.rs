@@ -1,17 +1,22 @@
-use std::io::{self, Cursor};
-use std::path::Path;
+use std::fs;
+use std::io::{self, Cursor, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use actix_rt::net::TcpStream;
 use actix_server::Server;
 use actix_service::{fn_service, ServiceFactoryExt as _};
 use awscreds::Credentials;
 use awsregion::Region;
+use mime_sniffer::MimeTypeSniffer;
 use postcard::{from_bytes, to_allocvec};
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use s3::{Bucket, BucketConfiguration};
 use s3::error::S3Error;
+use s3::{Bucket, BucketConfiguration};
+use serde::{Deserialize, Serialize};
 use surrealdb::Datastore;
+use time::{OffsetDateTime, format_description::well_known::iso8601};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use ulid::Ulid;
@@ -125,6 +130,16 @@ pub async fn work(ds: Arc<Datastore>, command: &Command) {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct BlobDescription {
+    id: Ulid,
+    original_path: PathBuf,
+    created: SystemTime,
+    modified: SystemTime,
+    size: u64,
+    mime_type: Option<String>,
+}
+
 pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
     tracing::trace!("add_path processing ...");
     for entry in WalkDir::new(path).into_iter() {
@@ -141,29 +156,29 @@ pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
         tx.put(format!("jobs:{}", Ulid::new()), bytes)
             .await
             .unwrap();
+
+        let metadata = fs::metadata(entry.path()).unwrap();
+        let blob = BlobDescription {
+            id: Ulid::new(),
+            original_path: entry.path().to_path_buf(),
+            created: metadata.created().unwrap(),
+            modified: metadata.modified().unwrap(),
+            size: metadata.len(),
+            mime_type: None,
+        };
+        let bytes = to_allocvec(&blob).unwrap();
+        tx.put(format!("blobs:{}", blob.id), bytes).await.unwrap();
         tx.commit().await.unwrap();
 
-        fetch_file(entry.path()).await?;
+        fetch_file(&blob).await?;
     }
 
     Ok(())
 }
 
-pub async fn fetch_file(path: &Path) -> io::Result<()> {
-    tracing::trace!("fetch_file processing {}", path.display());
+async fn fetch_file(blob: &BlobDescription) -> io::Result<()> {
+    tracing::trace!("fetch_file processing {}", blob.original_path.display());
 
-    // let status_code = Bucket::create(
-    //     "blobs",
-    //     Region::Custom {
-    //         region: Region::EuWest2.to_string(),
-    //         endpoint: "http://localhost:9000".to_owned(),
-    //     },
-    //     Credentials::new(Some("ziwa"), Some("ziwadevpass"), None, None, None).unwrap(),
-    //     BucketConfiguration::default(),
-    // ).await.unwrap();
-    
-    // tracing::trace!("status from bucket create {:?}", status_code.response_text);
-    
     let bucket = Bucket::new(
         "blobs",
         Region::Custom {
@@ -171,12 +186,72 @@ pub async fn fetch_file(path: &Path) -> io::Result<()> {
             endpoint: "http://localhost:9000".to_owned(),
         },
         Credentials::new(Some("ziwa"), Some("ziwadevpass"), None, None, None).unwrap(),
-    ).unwrap()
+    )
+    .unwrap()
     .with_path_style();
 
-    let mut file = File::open(path).await?;
-    let status_code = bucket.put_object_stream(&mut file, path.to_str().unwrap()).await.unwrap();
+    let mut file = File::open(&blob.original_path).await?;
+
+    let status_code = bucket
+        .put_object_stream(&mut file, format!("blobs:{}", blob.id))
+        .await
+        .unwrap();
     tracing::trace!("status from bucket write {:?}", status_code);
+
+    determine_file_type(&blob).await.unwrap();
+
+    Ok(())
+}
+
+fn fmttime<T>(time: T) -> String 
+    where T: Into<OffsetDateTime> {
+    time.into().format(&iso8601::Iso8601::DEFAULT).unwrap()
+}
+
+async fn determine_file_type(blob: &BlobDescription) -> io::Result<()> {
+    let metadata = fs::metadata(&blob.original_path).unwrap();
+
+    // Use local file, it is not modified
+    let mut file = if metadata.created().unwrap() == blob.created
+        && metadata.modified().unwrap() == blob.modified
+    {
+        tracing::trace!("local file unmodified, using original");
+        File::open(&blob.original_path).await?
+    } else {
+        tracing::trace!(
+            "local file modified {} != {} retrieving new copy from cold storage",
+            fmttime(blob.modified),
+            fmttime(metadata.modified().unwrap()),
+        );
+
+        let bucket = Bucket::new(
+            "blobs",
+            Region::Custom {
+                region: Region::EuWest2.to_string(),
+                endpoint: "http://localhost:9000".to_owned(),
+            },
+            Credentials::new(Some("ziwa"), Some("ziwadevpass"), None, None, None).unwrap(),
+        )
+        .unwrap()
+        .with_path_style();
+
+        let mut file = File::create(format!("data/blobs/{}", blob.id))
+            .await
+            .unwrap();
+        let status_code = bucket
+            .get_object_stream(format!("blobs:{}", blob.id), &mut file)
+            .await
+            .unwrap();
+        tracing::trace!("status from bucket write {:?}", status_code);
+        // file.seek(SeekFrom::Start(0))?;
+        file
+    };
+
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await.unwrap();
+    let bytes = &buffer[..];
+    let mime_type = bytes.sniff_mime_type();
+    dbg!(&mime_type);
 
     Ok(())
 }
