@@ -1,0 +1,4 @@
+#V2
+select * from admin;
+INFO FOR DB;
+NS: test;

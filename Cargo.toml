@@ -17,19 +17,22 @@ clap = "*"
 
 env_logger = "*"
 
+faktory = "*"
+
 futures-core = { version = "*", default-features = false, features = ["alloc"] }
 futures-util = { version = "*", default-features = false, features = ["alloc"] }
 mio = { version = "*", features = ["os-poll", "net"] }
 num_cpus = "*"
 serde = "*"
+serde_json = "*"
 socket2 = "*"
 tokio = { version = "*", features = ["io-util", "sync", "rt-multi-thread", "macros", "fs"] }
 tokio-uring = { version = "0.4", optional = true }
 
 mime-sniffer = "0.1.2"
 
-aws-creds = "*"
-aws-region = "*"
+aws-creds = "0.30"
+aws-region = "0.25"
 rust-s3 = "*"
 
 rayon = "*"

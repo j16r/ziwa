@@ -12,3 +12,15 @@ services:
       MINIO_TRACE: console
     command: server --console-address ":9001" /data
     restart: unless-stopped
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    ports: 
+      - '8000:8000'
+    command: start
+
+  jobqueue:
+    image: contribsys/faktory
+    ports:
+      - '7419:7419'
+      - '7420:7420'

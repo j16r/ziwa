@@ -5,10 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use actix_rt::net::TcpStream;
+use actix_rt::task::spawn_blocking;
 use actix_server::Server;
 use actix_service::{fn_service, ServiceFactoryExt as _};
 use awscreds::Credentials;
 use awsregion::Region;
+use faktory::{ConsumerBuilder, Producer, Job};
 use mime_sniffer::MimeTypeSniffer;
 use postcard::{from_bytes, to_allocvec};
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -16,7 +18,7 @@ use s3::error::S3Error;
 use s3::{Bucket, BucketConfiguration};
 use serde::{Deserialize, Serialize};
 use surrealdb::Datastore;
-use time::{OffsetDateTime, format_description::well_known::iso8601};
+use time::{format_description::well_known::iso8601, OffsetDateTime};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use ulid::Ulid;
@@ -29,20 +31,24 @@ async fn spawn_worker(
     _thread_pool: Arc<Mutex<ThreadPool>>,
     command: &Command,
 ) -> io::Result<()> {
-    let worker_ds = ds.clone();
-    let worker_command = command.clone();
+    // let worker_ds = ds.clone();
+    // let worker_command = command.clone();
 
-    let mut tx = ds.transaction(true, false).await.unwrap();
+    let mut p = Producer::connect(None).unwrap();
     let bytes = to_allocvec(&command).unwrap();
-    tx.put(format!("jobs:{}", Ulid::new()), bytes)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
+    p.enqueue(Job::new("jobs", vec![bytes])).unwrap();
 
-    tokio::spawn(async move {
-        tracing::trace!("worker...");
-        work(worker_ds, &worker_command).await;
-    });
+    // let mut tx = ds.transaction(true, false).await.unwrap();
+    // let bytes = to_allocvec(&command).unwrap();
+    // tx.put(format!("jobs:{}", Ulid::new()), bytes)
+    //     .await
+    //     .unwrap();
+    // tx.commit().await.unwrap();
+
+    // tokio::spawn(async move {
+    //     tracing::trace!("worker...");
+    //     work(worker_ds, &worker_command).await;
+    // });
 
     Ok(())
 }
@@ -53,6 +59,28 @@ pub async fn run() -> io::Result<()> {
 
     let ds = Arc::new(Datastore::new("memory").await.unwrap());
     let thread_pool = Arc::new(Mutex::new(ThreadPoolBuilder::new().build().unwrap()));
+
+    let mut c = ConsumerBuilder::default();
+    let worker_ds = ds.clone();
+    c.register("jobs", move |job| -> io::Result<()> {
+        tracing::trace!("running job {:?}", job);
+
+        let input: Vec<u8> = serde_json::to_vec(&job.args()[0]).unwrap();
+        let command: Command = from_bytes(&input[..]).unwrap();
+
+        tracing::trace!("command {:?}", command);
+        work(worker_ds.clone(), &command);
+        Ok(())
+    });
+
+    let mut c = c.connect(None).unwrap();
+
+    spawn_blocking(move || {
+        if let Err(e) = c.run(&["default"]) {
+            tracing::error!("worker failed {:?}", e);
+        }
+        tracing::trace!("worker finished");
+    });
 
     Server::build()
         .bind("control", addr, move || {
@@ -158,7 +186,7 @@ pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
             .unwrap();
 
         let metadata = fs::metadata(entry.path()).unwrap();
-        let blob = BlobDescription {
+        let mut blob = BlobDescription {
             id: Ulid::new(),
             original_path: entry.path().to_path_buf(),
             created: metadata.created().unwrap(),
@@ -170,13 +198,13 @@ pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
         tx.put(format!("blobs:{}", blob.id), bytes).await.unwrap();
         tx.commit().await.unwrap();
 
-        fetch_file(&blob).await?;
+        fetch_file(ds.clone(), &mut blob).await?;
     }
 
     Ok(())
 }
 
-async fn fetch_file(blob: &BlobDescription) -> io::Result<()> {
+async fn fetch_file(ds: Arc<Datastore>, blob: &mut BlobDescription) -> io::Result<()> {
     tracing::trace!("fetch_file processing {}", blob.original_path.display());
 
     let bucket = Bucket::new(
@@ -198,17 +226,19 @@ async fn fetch_file(blob: &BlobDescription) -> io::Result<()> {
         .unwrap();
     tracing::trace!("status from bucket write {:?}", status_code);
 
-    determine_file_type(&blob).await.unwrap();
+    determine_file_type(ds.clone(), blob).await.unwrap();
 
     Ok(())
 }
 
-fn fmttime<T>(time: T) -> String 
-    where T: Into<OffsetDateTime> {
+fn fmttime<T>(time: T) -> String
+where
+    T: Into<OffsetDateTime>,
+{
     time.into().format(&iso8601::Iso8601::DEFAULT).unwrap()
 }
 
-async fn determine_file_type(blob: &BlobDescription) -> io::Result<()> {
+async fn determine_file_type(ds: Arc<Datastore>, blob: &mut BlobDescription) -> io::Result<()> {
     let metadata = fs::metadata(&blob.original_path).unwrap();
 
     // Use local file, it is not modified
@@ -250,8 +280,14 @@ async fn determine_file_type(blob: &BlobDescription) -> io::Result<()> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).await.unwrap();
     let bytes = &buffer[..];
-    let mime_type = bytes.sniff_mime_type();
+    let mime_type = bytes.sniff_mime_type().unwrap();
     dbg!(&mime_type);
+
+    let mut tx = ds.transaction(true, false).await.unwrap();
+    blob.mime_type = Some(mime_type.to_owned());
+    let bytes = to_allocvec(&blob).unwrap();
+    tx.put(format!("blobs:{}", blob.id), bytes).await.unwrap();
+    tx.commit().await.unwrap();
 
     Ok(())
 }
