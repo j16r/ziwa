@@ -11,6 +11,9 @@ actix-service = "*"
 actix-server = "*"
 actix-utils = "*"
 
+anyhow = "*"
+
+base64ct = "*"
 bytes = "*"
 
 clap = "*"
@@ -37,6 +40,7 @@ rust-s3 = "*"
 
 rayon = "*"
 
+sha2 = "*"
 surrealdb = "1.0.0-beta.8"
 
 time = "0.3"

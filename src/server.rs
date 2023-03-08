@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Cursor, SeekFrom};
+use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -10,12 +10,12 @@ use actix_server::Server;
 use actix_service::{fn_service, ServiceFactoryExt as _};
 use awscreds::Credentials;
 use awsregion::Region;
-use faktory::{ConsumerBuilder, Producer, Job};
+use base64ct::{Base64, Encoding};
+use faktory::{ConsumerBuilder, Job, Producer};
 use mime_sniffer::MimeTypeSniffer;
 use postcard::{from_bytes, to_allocvec};
-use rayon::{ThreadPool, ThreadPoolBuilder};
-use s3::error::S3Error;
-use s3::{Bucket, BucketConfiguration};
+use s3::Bucket;
+use sha2::{Sha512, Digest};
 use serde::{Deserialize, Serialize};
 use surrealdb::Datastore;
 use time::{format_description::well_known::iso8601, OffsetDateTime};
@@ -26,29 +26,12 @@ use walkdir::WalkDir;
 
 use crate::rpc::{Command, Response};
 
-async fn spawn_worker(
-    ds: Arc<Datastore>,
-    _thread_pool: Arc<Mutex<ThreadPool>>,
-    command: &Command,
-) -> io::Result<()> {
-    // let worker_ds = ds.clone();
-    // let worker_command = command.clone();
-
+async fn spawn_worker(command: &Command) -> io::Result<()> {
     let mut p = Producer::connect(None).unwrap();
     let bytes = to_allocvec(&command).unwrap();
+
+    tracing::trace!("enqueuing job {:?}", &bytes);
     p.enqueue(Job::new("jobs", vec![bytes])).unwrap();
-
-    // let mut tx = ds.transaction(true, false).await.unwrap();
-    // let bytes = to_allocvec(&command).unwrap();
-    // tx.put(format!("jobs:{}", Ulid::new()), bytes)
-    //     .await
-    //     .unwrap();
-    // tx.commit().await.unwrap();
-
-    // tokio::spawn(async move {
-    //     tracing::trace!("worker...");
-    //     work(worker_ds, &worker_command).await;
-    // });
 
     Ok(())
 }
@@ -58,18 +41,24 @@ pub async fn run() -> io::Result<()> {
     tracing::info!("starting server on port: {}", &addr.0);
 
     let ds = Arc::new(Datastore::new("memory").await.unwrap());
-    let thread_pool = Arc::new(Mutex::new(ThreadPoolBuilder::new().build().unwrap()));
 
     let mut c = ConsumerBuilder::default();
     let worker_ds = ds.clone();
     c.register("jobs", move |job| -> io::Result<()> {
         tracing::trace!("running job {:?}", job);
 
-        let input: Vec<u8> = serde_json::to_vec(&job.args()[0]).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let input: Vec<u8> = serde_json::from_value(job.args()[0].clone()).unwrap();
         let command: Command = from_bytes(&input[..]).unwrap();
 
         tracing::trace!("command {:?}", command);
-        work(worker_ds.clone(), &command);
+        let worker_ds = worker_ds.clone();
+        rt.block_on(async move {
+            work(worker_ds.clone(), &command).await;
+        });
         Ok(())
     });
 
@@ -84,13 +73,7 @@ pub async fn run() -> io::Result<()> {
 
     Server::build()
         .bind("control", addr, move || {
-            let thread_pool = thread_pool.clone();
-            let ds = ds.clone();
-
             fn_service(move |mut stream: TcpStream| {
-                let thread_pool = thread_pool.clone();
-                let ds = ds.clone();
-
                 async move {
                     let mut len_input = 0_usize.to_be_bytes();
                     match stream.read_exact(&mut len_input).await {
@@ -120,7 +103,7 @@ pub async fn run() -> io::Result<()> {
                     let command: Command = from_bytes(&bytes).unwrap();
                     tracing::trace!("got command {:?}", command);
 
-                    let response = match spawn_worker(ds, thread_pool, &command).await {
+                    let response = match spawn_worker(&command).await {
                         Ok(()) => Response::Ok,
                         Err(_) => Response::Error,
                     };
@@ -166,6 +149,7 @@ struct BlobDescription {
     modified: SystemTime,
     size: u64,
     mime_type: Option<String>,
+    digest: Option<String>,
 }
 
 pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
@@ -193,6 +177,7 @@ pub async fn add_path(ds: Arc<Datastore>, path: &Path) -> io::Result<()> {
             modified: metadata.modified().unwrap(),
             size: metadata.len(),
             mime_type: None,
+            digest: None,
         };
         let bytes = to_allocvec(&blob).unwrap();
         tx.put(format!("blobs:{}", blob.id), bytes).await.unwrap();
@@ -277,16 +262,22 @@ async fn determine_file_type(ds: Arc<Datastore>, blob: &mut BlobDescription) -> 
         file
     };
 
+    let mut digest = Sha512::new();
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).await.unwrap();
     let bytes = &buffer[..];
-    let mime_type = bytes.sniff_mime_type().unwrap();
-    dbg!(&mime_type);
+    digest.update(&bytes);
+    let mime_type = bytes.sniff_mime_type();
+    tracing::debug!("determined mime type {:?}", mime_type);
+
+    let hash = digest.finalize();
+    tracing::debug!("file digest {:?}", hash);
+    blob.digest = Some(Base64::encode_string(&hash));
 
     let mut tx = ds.transaction(true, false).await.unwrap();
-    blob.mime_type = Some(mime_type.to_owned());
+    blob.mime_type = mime_type.map(|t| t.to_owned());
     let bytes = to_allocvec(&blob).unwrap();
-    tx.put(format!("blobs:{}", blob.id), bytes).await.unwrap();
+    tx.set(format!("blobs:{}", blob.id), bytes).await.unwrap();
     tx.commit().await.unwrap();
 
     Ok(())
