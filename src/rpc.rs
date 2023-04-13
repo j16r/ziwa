@@ -8,6 +8,13 @@ pub enum Command {
     FilesAdd(PathBuf),
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+#[serde(tag = "type")]
+pub enum CommandRecord {
+    ShutDown,
+    FilesAdd(PathBuf),
+}
+
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub enum Response {
     Ok,

@@ -4,7 +4,6 @@ use std::path::Path;
 
 use actix_rt::net::TcpStream;
 use bytes::BytesMut;
-use postcard::{from_bytes, to_allocvec};
 
 use crate::rpc::{Command, Response};
 
@@ -14,7 +13,7 @@ pub async fn add(path: &Path) -> io::Result<()> {
     let stream = TcpStream::connect("127.0.0.1:34982").await?;
     let command = Command::FilesAdd(path.to_path_buf());
 
-    let output = to_allocvec(&command).unwrap();
+    let output = bincode::serialize(&command).unwrap();
     let len_output = output.len().to_be_bytes();
     stream.try_write(&len_output).unwrap();
 
@@ -37,7 +36,7 @@ pub async fn add(path: &Path) -> io::Result<()> {
     }
 
     let buffer: bytes::Bytes = bytes.freeze();
-    let response: Response = from_bytes(&buffer[..]).unwrap();
+    let response: Response = bincode::deserialize(&buffer[..]).unwrap();
     match response {
         Response::Ok => tracing::trace!("completed successfully"),
         Response::Error => tracing::error!("command failed"),

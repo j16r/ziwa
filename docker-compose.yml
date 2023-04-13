@@ -17,10 +17,28 @@ services:
     image: surrealdb/surrealdb:latest
     ports: 
       - '8000:8000'
-    command: start
+    command: start --log trace --user ziwa --pass ziwadevpass
 
-  jobqueue:
-    image: contribsys/faktory
+  redpanda:
+    image: vectorized/redpanda:latest
     ports:
-      - '7419:7419'
-      - '7420:7420'
+      - "9092:9092"
+    command:
+      - redpanda
+      - start
+      - --smp 1
+      - --memory 1G
+      - --reserve-memory 0M
+      - --node-id 0
+      - --check=false
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:9093
+      - --advertise-kafka-addr
+      - PLAINTEXT://localhost:9092,OUTSIDE://localhost:9093
+    environment:
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+
+volumes:
+  redpanda-data:

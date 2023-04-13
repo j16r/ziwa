@@ -34,7 +34,9 @@ async fn main() -> io::Result<()> {
 
     if let Some(subcommand) = matches.subcommand_matches("server") {
         if let Some(_subcommand) = subcommand.subcommand_matches("run") {
-            server::run().await?;
+            if let Err(e) = server::run().await {
+                tracing::error!("error running server {}", e);
+            }
         }
     } else if let Some(subcommand) = matches.subcommand_matches("files") {
         if let Some(subcommand) = subcommand.subcommand_matches("add") {
