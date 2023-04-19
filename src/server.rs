@@ -1,52 +1,38 @@
 use std::fs;
-use std::io::{self, Cursor};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use actix_rt::net::TcpStream;
-use actix_rt::task::spawn_blocking;
 use actix_server::Server;
 use actix_service::{fn_service, ServiceFactoryExt as _};
 use anyhow::Result;
 use awscreds::Credentials;
 use awsregion::Region;
 use base64ct::{Base64, Encoding};
-use faktory::{ConsumerBuilder, Job, Producer};
 use futures_util::{StreamExt, TryStreamExt};
 use mime_sniffer::MimeTypeSniffer;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{stream_consumer::StreamConsumer, Consumer};
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::Message;
 use s3::Bucket;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use std::env;
 use surrealdb::engine::remote::ws::Ws;
 use surrealdb::opt::auth::Root;
-use surrealdb::sql::Thing;
 use surrealdb::Surreal;
 use time::{format_description::well_known::iso8601, OffsetDateTime};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::task::JoinHandle;
 use walkdir::WalkDir;
 
 use crate::rpc::{Command, Response};
 
-async fn process_message(msg: &rdkafka::message::OwnedMessage) {
-    let payload = match msg.payload_view::<str>() {
-        Some(Ok(payload)) => payload,
-        Some(Err(_)) => {
-            eprintln!("Failed to deserialize message payload");
-            return;
-        }
-        None => "<empty>",
-    };
-    println!("Received message: {}", payload);
-}
-
-async fn run_consumer() {
+async fn run_consumer<T: surrealdb::Connection>(ds: Arc<Surreal<T>>) {
+    tracing::trace!("creating stream consumer config");
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "0.0.0.0:9092")
         .set("group.id", "dev")
@@ -54,13 +40,20 @@ async fn run_consumer() {
         .create()
         .expect("Consumer creation failed");
 
+    tracing::trace!("subscribing...");
     consumer
         .subscribe(&["jobs"])
         .expect("Can't subscribe to specified topic");
 
+    tracing::trace!("starting event consumer");
+    let stream_ds = &ds.clone();
     let stream_processor = consumer.stream().try_for_each(|message| async move {
+        let task_ds = stream_ds.clone();
         let message = message.detach();
-        let task = tokio::spawn(async move { process_message(&message).await });
+        let task = tokio::spawn(async move { 
+            let scope_ds = task_ds.clone();
+            process_message(scope_ds, &message).await;
+        });
         task.await.unwrap();
         Ok(())
     });
@@ -68,32 +61,43 @@ async fn run_consumer() {
     stream_processor.await.expect("stream processing failed");
 }
 
-async fn spawn_worker(command: &Command) -> Result<()> {
-    let mut p = Producer::connect(None)?;
-    let bytes = bincode::serialize(&command)?;
-
-    tracing::trace!("enqueuing job {:?}", &bytes);
-    p.enqueue(Job::new("jobs", vec![bytes]))?;
-
-    Ok(())
-}
-
-pub async fn run() -> Result<()> {
-    let addr = ("127.0.0.1", 34982);
-    tracing::info!("starting server on port: {}", &addr.0);
-
-    let ds = Arc::new(Surreal::new::<Ws>("127.0.0.1:8000").await?);
-
+async fn manage_ds<T: surrealdb::Connection>(ds: Arc<Surreal<T>>) -> Result<()> {
+    tracing::trace!("signing in");
     ds.signin(Root {
         username: "ziwa",
         password: "ziwadevpass",
     })
     .await?;
 
+    tracing::trace!("using ns/db in");
     ds.use_ns("test").use_db("test").await?;
 
-    tokio::spawn(run_consumer());
+    tracing::trace!("finished setting up surrealdb");
+    Ok(())
+}
 
+pub async fn run() -> Result<()> {
+    tracing::trace!("connecting to surreal");
+    let ds = Arc::new(Surreal::new::<Ws>("127.0.0.1:8000").await?);
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", "0.0.0.0:9092")
+        .create()
+        .expect("Consumer creation failed");
+
+    producer
+        .send(
+            FutureRecord::to(&"jobs").key("startup").payload(&vec![]),
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+
+    tokio::spawn(manage_ds(ds.clone()));
+    tokio::spawn(run_consumer(ds));
+
+    let addr = ("127.0.0.1", 34982);
+    tracing::trace!("starting server on: {}:{}", &addr.0, &addr.1);
     Server::build()
         .bind("control", addr, move || {
             fn_service(move |mut stream: TcpStream| async move {
@@ -123,13 +127,22 @@ pub async fn run() -> Result<()> {
                 tracing::trace!("completed reading input from cli");
 
                 let command: Command = bincode::deserialize(&bytes).unwrap();
-                tracing::trace!("got command {:?}", command);
+                tracing::trace!("got command from cli {:?}", command);
 
-                let response = match spawn_worker(&command).await {
-                    Ok(()) => Response::Ok,
-                    Err(_) => Response::Error,
-                };
+                let producer: FutureProducer = ClientConfig::new()
+                    .set("bootstrap.servers", "0.0.0.0:9092")
+                    .create()
+                    .expect("Consumer creation failed");
 
+                producer
+                    .send(
+                        FutureRecord::to(&"jobs").key("some key").payload(&bytes),
+                        Duration::from_secs(0),
+                    )
+                    .await
+                    .unwrap();
+
+                let response = Response::Ok;
                 let mut output = Cursor::new(bincode::serialize(&response).unwrap());
                 stream.write_buf(&mut output).await.unwrap();
 
@@ -144,7 +157,23 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-pub async fn work<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, command: &Command) {
+async fn process_message<T: surrealdb::Connection>(
+    ds: Arc<Surreal<T>>,
+    msg: &rdkafka::message::OwnedMessage,
+) {
+    if let Some(bytes) = msg.payload() {
+        if bytes.len() == 0 {
+            return;
+        }
+        let command: Command = bincode::deserialize(&bytes).unwrap();
+
+        tracing::trace!("got command from event source {:?}", command);
+
+        work(ds, &command).await;
+    }
+}
+
+async fn work<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, command: &Command) {
     tracing::info!("starting worker on {:?}", &command);
 
     let result = match command {
@@ -175,7 +204,7 @@ struct BlobDescription {
     digest: Option<String>,
 }
 
-pub async fn add_path<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, path: &Path) -> Result<()> {
+async fn add_path<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, path: &Path) -> Result<()> {
     tracing::trace!("add_path processing ...");
     for entry in WalkDir::new(path).into_iter() {
         let entry = entry?;
@@ -270,16 +299,14 @@ async fn determine_file_type<T: surrealdb::Connection>(
         )?
         .with_path_style();
 
-        let mut response = bucket
-            .get_object_stream(format!("blobs:{}", blob.id))
+        let mut file = File::create(format!("data/blobs/{}", blob.id)).await?;
+
+        let response = bucket
+            .get_object_to_writer(format!("blobs:{}", blob.id), &mut file)
             .await?;
 
-        let mut file = File::create(format!("data/blobs/{}", blob.id)).await?;
-        while let Some(chunk) = response.bytes().next().await {
-            file.write_all(&chunk).await?;
-        }
+        tracing::trace!("status from bucket write {:?}", response);
 
-        tracing::trace!("status from bucket write {:?}", response.status_code);
         // file.seek(SeekFrom::Start(0))?;
         file
     };

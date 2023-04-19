@@ -1,4 +1,4 @@
-version: "3.7"
+version: "3.8"
 
 services:
   minio:
@@ -23,21 +23,26 @@ services:
     image: vectorized/redpanda:latest
     ports:
       - "9092:9092"
+    entrypoint: ["/entrypoint.sh"]
     command:
+      - rpk
       - redpanda
       - start
-      - --smp 1
-      - --memory 1G
-      - --reserve-memory 0M
-      - --node-id 0
+      - --smp
+      - '1'
+      - --memory
+      - '1G'
+      - --reserve-memory
+      - '0M'
+      - --node-id
+      - '0'
       - --check=false
       - --kafka-addr
       - PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:9093
       - --advertise-kafka-addr
       - PLAINTEXT://localhost:9092,OUTSIDE://localhost:9093
-    environment:
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
     volumes:
+      - ./entrypoint.sh:/entrypoint.sh
       - redpanda-data:/var/lib/redpanda/data
 
 volumes:
