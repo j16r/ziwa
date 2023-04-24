@@ -12,7 +12,7 @@ use anyhow::Result;
 use awscreds::Credentials;
 use awsregion::Region;
 use base64::{engine::general_purpose, Engine as _};
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use mime_sniffer::MimeTypeSniffer;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{stream_consumer::StreamConsumer, Consumer};
@@ -86,7 +86,7 @@ pub async fn run() -> Result<()> {
 
     producer
         .send(
-            FutureRecord::to(&"jobs").key("startup").payload(&vec![]),
+            FutureRecord::to("jobs").key("startup").payload(&vec![]),
             Duration::from_secs(0),
         )
         .await
@@ -135,7 +135,7 @@ pub async fn run() -> Result<()> {
 
                 producer
                     .send(
-                        FutureRecord::to(&"jobs").key("some key").payload(&bytes),
+                        FutureRecord::to("jobs").key("some key").payload(&bytes),
                         Duration::from_secs(0),
                     )
                     .await
@@ -158,10 +158,10 @@ pub async fn run() -> Result<()> {
 
 async fn process_message(ds: Arc<PgPool>, msg: &rdkafka::message::OwnedMessage) {
     if let Some(bytes) = msg.payload() {
-        if bytes.len() == 0 {
+        if bytes.is_empty() {
             return;
         }
-        let command: Command = bincode::deserialize(&bytes).unwrap();
+        let command: Command = bincode::deserialize(bytes).unwrap();
 
         tracing::trace!("got command from event source {:?}", command);
 
@@ -211,7 +211,7 @@ async fn add_path(ds: Arc<PgPool>, path: &Path) -> Result<()> {
         tracing::trace!("adding {:?}", entry);
 
         let command = Command::FilesAdd(entry.path().to_path_buf());
-        let rec = sqlx::query(
+        sqlx::query(
             r#"
 INSERT INTO jobs ( job, data )
 VALUES ( $1::job_type, $2 )
@@ -325,17 +325,17 @@ async fn determine_file_type(ds: Arc<PgPool>, blob: &mut BlobDescription) -> Res
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).await?;
     let bytes = &buffer[..];
-    digest.update(&bytes);
+    digest.update(bytes);
     let mime_type = bytes.sniff_mime_type();
     tracing::debug!("determined mime type {:?}", mime_type);
 
-    let hash: String = general_purpose::STANDARD_NO_PAD.encode(&digest.finalize());
+    let hash: String = general_purpose::STANDARD_NO_PAD.encode(digest.finalize());
     tracing::debug!("file digest {:?}", hash);
     blob.digest = Some(hash);
 
     blob.mime_type = mime_type.map(|t| t.to_owned());
 
-    let rec = sqlx::query(
+    sqlx::query(
         r#"
 UPDATE blobs
 SET DATA = $1
