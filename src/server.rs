@@ -11,7 +11,7 @@ use actix_service::{fn_service, ServiceFactoryExt as _};
 use anyhow::Result;
 use awscreds::Credentials;
 use awsregion::Region;
-use base64ct::{Base64, Encoding};
+use base64::{engine::general_purpose, Engine as _};
 use futures_util::{StreamExt, TryStreamExt};
 use mime_sniffer::MimeTypeSniffer;
 use rdkafka::config::ClientConfig;
@@ -21,9 +21,9 @@ use rdkafka::Message;
 use s3::Bucket;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
-use surrealdb::engine::remote::ws::Ws;
-use surrealdb::opt::auth::Root;
-use surrealdb::Surreal;
+use sqlx::migrate::Migrator;
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::{types::Json, Row};
 use time::{format_description::well_known::iso8601, OffsetDateTime};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -31,7 +31,7 @@ use walkdir::WalkDir;
 
 use crate::rpc::{Command, Response};
 
-async fn run_consumer<T: surrealdb::Connection>(ds: Arc<Surreal<T>>) {
+async fn run_consumer(ds: Arc<PgPool>) {
     tracing::trace!("creating stream consumer config");
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "0.0.0.0:9092")
@@ -50,7 +50,7 @@ async fn run_consumer<T: surrealdb::Connection>(ds: Arc<Surreal<T>>) {
     let stream_processor = consumer.stream().try_for_each(|message| async move {
         let task_ds = stream_ds.clone();
         let message = message.detach();
-        let task = tokio::spawn(async move { 
+        let task = tokio::spawn(async move {
             let scope_ds = task_ds.clone();
             process_message(scope_ds, &message).await;
         });
@@ -61,24 +61,23 @@ async fn run_consumer<T: surrealdb::Connection>(ds: Arc<Surreal<T>>) {
     stream_processor.await.expect("stream processing failed");
 }
 
-async fn manage_ds<T: surrealdb::Connection>(ds: Arc<Surreal<T>>) -> Result<()> {
-    tracing::trace!("signing in");
-    ds.signin(Root {
-        username: "ziwa",
-        password: "ziwadevpass",
-    })
-    .await?;
-
-    tracing::trace!("using ns/db in");
-    ds.use_ns("test").use_db("test").await?;
-
-    tracing::trace!("finished setting up surrealdb");
+async fn manage_ds(ds: Arc<PgPool>) -> Result<()> {
+    let migrator = Migrator::new(Path::new("./migrations")).await?;
+    tracing::trace!("running migrations");
+    migrator.run(&*ds).await?;
+    tracing::trace!("migrations done");
     Ok(())
 }
 
 pub async fn run() -> Result<()> {
     tracing::trace!("connecting to surreal");
-    let ds = Arc::new(Surreal::new::<Ws>("127.0.0.1:8000").await?);
+
+    let ds = Arc::new(
+        PgPoolOptions::new()
+            .max_connections(5)
+            .connect("postgres://ziwadev:ziwadevpass@localhost/ziwadev")
+            .await?,
+    );
 
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", "0.0.0.0:9092")
@@ -93,7 +92,7 @@ pub async fn run() -> Result<()> {
         .await
         .unwrap();
 
-    tokio::spawn(manage_ds(ds.clone()));
+    manage_ds(ds.clone()).await?;
     tokio::spawn(run_consumer(ds));
 
     let addr = ("127.0.0.1", 34982);
@@ -157,10 +156,7 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn process_message<T: surrealdb::Connection>(
-    ds: Arc<Surreal<T>>,
-    msg: &rdkafka::message::OwnedMessage,
-) {
+async fn process_message(ds: Arc<PgPool>, msg: &rdkafka::message::OwnedMessage) {
     if let Some(bytes) = msg.payload() {
         if bytes.len() == 0 {
             return;
@@ -173,7 +169,7 @@ async fn process_message<T: surrealdb::Connection>(
     }
 }
 
-async fn work<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, command: &Command) {
+async fn work(ds: Arc<PgPool>, command: &Command) {
     tracing::info!("starting worker on {:?}", &command);
 
     let result = match command {
@@ -195,7 +191,7 @@ async fn work<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, command: &Command) 
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 struct BlobDescription {
-    id: u64,
+    id: i64,
     original_path: PathBuf,
     created: SystemTime,
     modified: SystemTime,
@@ -204,7 +200,7 @@ struct BlobDescription {
     digest: Option<String>,
 }
 
-async fn add_path<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, path: &Path) -> Result<()> {
+async fn add_path(ds: Arc<PgPool>, path: &Path) -> Result<()> {
     tracing::trace!("add_path processing ...");
     for entry in WalkDir::new(path).into_iter() {
         let entry = entry?;
@@ -215,11 +211,21 @@ async fn add_path<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, path: &Path) ->
         tracing::trace!("adding {:?}", entry);
 
         let command = Command::FilesAdd(entry.path().to_path_buf());
-        let created: Command = ds.create("jobs").content(command).await?;
-        dbg!(&created);
+        let rec = sqlx::query(
+            r#"
+INSERT INTO jobs ( job, data )
+VALUES ( $1::job_type, $2 )
+RETURNING id
+        "#,
+        )
+        .bind(command.to_string())
+        .bind(Json(&command))
+        .fetch_one(&*ds)
+        .await?;
+        dbg!(&command);
 
         let metadata = fs::metadata(entry.path())?;
-        let blob = BlobDescription {
+        let mut blob = BlobDescription {
             id: 0,
             original_path: entry.path().to_path_buf(),
             created: metadata.created()?,
@@ -228,7 +234,17 @@ async fn add_path<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, path: &Path) ->
             mime_type: None,
             digest: None,
         };
-        let mut blob: BlobDescription = ds.create("blobs").content(blob).await?;
+        let rec = sqlx::query(
+            r#"
+INSERT INTO blobs ( data )
+VALUES ( $1 )
+RETURNING id
+        "#,
+        )
+        .bind(Json(&blob))
+        .fetch_one(&*ds)
+        .await?;
+        blob.id = rec.try_get("id")?;
         dbg!(&blob);
 
         fetch_file(ds.clone(), &mut blob).await?;
@@ -237,14 +253,11 @@ async fn add_path<T: surrealdb::Connection>(ds: Arc<Surreal<T>>, path: &Path) ->
     Ok(())
 }
 
-async fn fetch_file<T: surrealdb::Connection>(
-    ds: Arc<Surreal<T>>,
-    blob: &mut BlobDescription,
-) -> Result<()> {
+async fn fetch_file(ds: Arc<PgPool>, blob: &mut BlobDescription) -> Result<()> {
     tracing::trace!("fetch_file processing {}", blob.original_path.display());
 
     let bucket = Bucket::new(
-        "blobs",
+        "ziwadev",
         Region::Custom {
             region: Region::EuWest2.to_string(),
             endpoint: "http://localhost:9000".to_owned(),
@@ -256,7 +269,7 @@ async fn fetch_file<T: surrealdb::Connection>(
     let mut file = File::open(&blob.original_path).await?;
 
     let status_code = bucket
-        .put_object_stream(&mut file, format!("blobs:{}", blob.id))
+        .put_object_stream(&mut file, format!("blob:{}", blob.id))
         .await?;
     tracing::trace!("status from bucket write {:?}", status_code);
 
@@ -272,10 +285,7 @@ where
     time.into().format(&iso8601::Iso8601::DEFAULT).unwrap()
 }
 
-async fn determine_file_type<T: surrealdb::Connection>(
-    ds: Arc<Surreal<T>>,
-    blob: &mut BlobDescription,
-) -> Result<()> {
+async fn determine_file_type(ds: Arc<PgPool>, blob: &mut BlobDescription) -> Result<()> {
     let metadata = fs::metadata(&blob.original_path)?;
 
     // Use local file, it is not modified
@@ -319,12 +329,26 @@ async fn determine_file_type<T: surrealdb::Connection>(
     let mime_type = bytes.sniff_mime_type();
     tracing::debug!("determined mime type {:?}", mime_type);
 
-    let hash = Base64::encode_string(&digest.finalize());
+    let hash: String = general_purpose::STANDARD_NO_PAD.encode(&digest.finalize());
     tracing::debug!("file digest {:?}", hash);
     blob.digest = Some(hash);
 
     blob.mime_type = mime_type.map(|t| t.to_owned());
-    let _blob: BlobDescription = ds.update(("blobs", blob.id)).await?;
+
+    let rec = sqlx::query(
+        r#"
+UPDATE blobs
+SET DATA = $1
+WHERE
+    id = $2
+        "#,
+    )
+    .bind(Json(&blob))
+    .bind(blob.id)
+    .execute(&*ds)
+    .await?;
+
+    dbg!(&blob);
 
     Ok(())
 }

@@ -13,7 +13,7 @@ actix-utils = "*"
 
 anyhow = "*"
 
-base64ct = "*"
+base64 = "*"
 bytes = "*"
 
 bincode = "*"
@@ -42,10 +42,15 @@ aws-region = "0.25"
 rust-s3 = { version = "0.33", features = ["with-tokio"] }
 tokio-stream = "*"
 
+strum = "0.24"
+strum_macros = "0.24"
+
 rayon = "*"
 
 sha2 = "*"
-surrealdb = "1.0.0-beta.8"
+
+# surrealdb = "1.0.0-beta.9"
+sqlx = { version = "0.6", features = [ "runtime-tokio-native-tls" , "postgres", "json" ] }
 
 time = "0.3"
 
