@@ -350,7 +350,14 @@ WHERE
     .execute(&*ds)
     .await?;
 
-    summarize_pdf(ds, &blob.ulid).await?;
+    match &blob.mime_type {
+        Some(s) => match s.as_ref() {
+            "application/pdf" => summarize_pdf(ds.clone(), &blob.ulid).await?,
+            "image/jpeg" => extract_exif(ds, &blob.ulid).await?,
+            other => tracing::warn!("unrecognized file type {}", other),
+        }
+        None => {},
+    }
 
     Ok(())
 }
@@ -368,6 +375,31 @@ async fn retrieve_blob(ds: Arc<PgPool>, blob_id: &Ulid) -> Result<BlobDescriptio
     Ok(blob)
 }
 
+async fn extract_exif(ds: Arc<PgPool>, blob_id: &Ulid) -> Result<()> {
+    tracing::trace!("extract_exif processing ...");
+
+    let blob = retrieve_blob(ds, blob_id).await?;
+    let mut file = concentre_blob(&blob).await?;
+
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+
+    let exifreader = exif::Reader::new();
+    let mut reader = Cursor::new(&mut buffer);
+    if let Ok(exif) = exifreader.read_from_container(&mut reader) {
+        for f in exif.fields() {
+            tracing::trace!(
+                "exif field {} {} {}",
+                f.tag,
+                f.ifd_num,
+                f.display_value().with_unit(&exif)
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn summarize_pdf(ds: Arc<PgPool>, blob_id: &Ulid) -> Result<()> {
     tracing::trace!("summarize_pdf processing ...");
 
@@ -377,7 +409,7 @@ async fn summarize_pdf(ds: Arc<PgPool>, blob_id: &Ulid) -> Result<()> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).await?;
 
-    let pdf = FileOptions::cached().load(buffer.as_slice()).unwrap();
+    let pdf = FileOptions::cached().load(buffer.as_slice())?;
 
     if let Some(ref info) = pdf.trailer.info_dict {
         let title = info.get("Title").and_then(|p| p.to_string_lossy().ok());
@@ -388,7 +420,6 @@ async fn summarize_pdf(ds: Arc<PgPool>, blob_id: &Ulid) -> Result<()> {
 
     for page in pdf.pages() {
         let page = page?;
-        dbg!(&page);
         if let Some(ref c) = page.contents {
             tracing::trace!("{:?}", c);
         }

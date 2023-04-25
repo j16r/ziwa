@@ -37,6 +37,7 @@ tokio-uring = { version = "0.4", optional = true }
 
 mime-sniffer = "0.1.2"
 pdf = "0.8.1"
+kamadak-exif = "0.5.5"
 
 aws-creds = "0.34"
 aws-region = "0.25"
