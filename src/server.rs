@@ -14,8 +14,9 @@ use awsregion::Region;
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::TryStreamExt;
 use mime_sniffer::MimeTypeSniffer;
+use pdf::file::FileOptions;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{stream_consumer::StreamConsumer, Consumer};
+use rdkafka::consumer::{stream_consumer::StreamConsumer, CommitMode, Consumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::Message;
 use s3::Bucket;
@@ -27,45 +28,40 @@ use sqlx::{types::Json, Row};
 use time::{format_description::well_known::iso8601, OffsetDateTime};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use ulid::Ulid;
 use walkdir::WalkDir;
 
 use crate::rpc::{Command, Response};
 
 async fn run_consumer(ds: Arc<PgPool>) {
-    tracing::trace!("creating stream consumer config");
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "0.0.0.0:9092")
         .set("group.id", "dev")
-        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
         .create()
         .expect("Consumer creation failed");
 
-    tracing::trace!("subscribing...");
     consumer
         .subscribe(&["jobs"])
         .expect("Can't subscribe to specified topic");
 
-    tracing::trace!("starting event consumer");
-    let stream_ds = &ds.clone();
-    let stream_processor = consumer.stream().try_for_each(|message| async move {
-        let task_ds = stream_ds.clone();
-        let message = message.detach();
-        let task = tokio::spawn(async move {
-            let scope_ds = task_ds.clone();
-            process_message(scope_ds, &message).await;
-        });
-        task.await.unwrap();
-        Ok(())
-    });
-
-    stream_processor.await.expect("stream processing failed");
+    loop {
+        match consumer.recv().await {
+            Err(e) => {
+                tracing::warn!("Kafka error: {}", e);
+            }
+            Ok(message) => {
+                let message = message.detach();
+                process_message(ds.clone(), &message).await;
+                consumer.commit_consumer_state(CommitMode::Async).unwrap();
+            }
+        }
+    }
 }
 
 async fn manage_ds(ds: Arc<PgPool>) -> Result<()> {
     let migrator = Migrator::new(Path::new("./migrations")).await?;
-    tracing::trace!("running migrations");
     migrator.run(&*ds).await?;
-    tracing::trace!("migrations done");
     Ok(())
 }
 
@@ -133,9 +129,10 @@ pub async fn run() -> Result<()> {
                     .create()
                     .expect("Consumer creation failed");
 
+                let key = Ulid::new().to_string();
                 producer
                     .send(
-                        FutureRecord::to("jobs").key("some key").payload(&bytes),
+                        FutureRecord::to("jobs").key(&key).payload(&bytes),
                         Duration::from_secs(0),
                     )
                     .await
@@ -159,6 +156,7 @@ pub async fn run() -> Result<()> {
 async fn process_message(ds: Arc<PgPool>, msg: &rdkafka::message::OwnedMessage) {
     if let Some(bytes) = msg.payload() {
         if bytes.is_empty() {
+            tracing::trace!("skipping empty message");
             return;
         }
         let command: Command = bincode::deserialize(bytes).unwrap();
@@ -176,10 +174,11 @@ async fn work(ds: Arc<PgPool>, command: &Command) {
         Command::ShutDown => {
             unimplemented!();
         }
-        Command::FilesAdd(path) => add_path(ds, path),
+        Command::FilesAdd(path) => add_path(ds, path).await,
+        Command::SummarizePdf(ulid) => summarize_pdf(ds, ulid).await,
     };
 
-    match result.await {
+    match result {
         Ok(()) => {
             tracing::info!("worker completed");
         }
@@ -192,6 +191,7 @@ async fn work(ds: Arc<PgPool>, command: &Command) {
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 struct BlobDescription {
     id: i64,
+    ulid: Ulid,
     original_path: PathBuf,
     created: SystemTime,
     modified: SystemTime,
@@ -222,11 +222,11 @@ RETURNING id
         .bind(Json(&command))
         .fetch_one(&*ds)
         .await?;
-        dbg!(&command);
 
         let metadata = fs::metadata(entry.path())?;
         let mut blob = BlobDescription {
             id: 0,
+            ulid: Ulid::new(),
             original_path: entry.path().to_path_buf(),
             created: metadata.created()?,
             modified: metadata.modified()?,
@@ -236,16 +236,16 @@ RETURNING id
         };
         let rec = sqlx::query(
             r#"
-INSERT INTO blobs ( data )
-VALUES ( $1 )
+INSERT INTO blobs ( ulid, data )
+VALUES ( $1, $2 )
 RETURNING id
         "#,
         )
+        .bind(blob.ulid.to_string())
         .bind(Json(&blob))
         .fetch_one(&*ds)
         .await?;
         blob.id = rec.try_get("id")?;
-        dbg!(&blob);
 
         fetch_file(ds.clone(), &mut blob).await?;
     }
@@ -268,9 +268,8 @@ async fn fetch_file(ds: Arc<PgPool>, blob: &mut BlobDescription) -> Result<()> {
 
     let mut file = File::open(&blob.original_path).await?;
 
-    let status_code = bucket
-        .put_object_stream(&mut file, format!("blob:{}", blob.id))
-        .await?;
+    let key = blob.original_path.display().to_string();
+    let status_code = bucket.put_object_stream(&mut file, key).await?;
     tracing::trace!("status from bucket write {:?}", status_code);
 
     determine_file_type(ds.clone(), blob).await?;
@@ -285,13 +284,13 @@ where
     time.into().format(&iso8601::Iso8601::DEFAULT).unwrap()
 }
 
-async fn determine_file_type(ds: Arc<PgPool>, blob: &mut BlobDescription) -> Result<()> {
+async fn concentre_blob(blob: &BlobDescription) -> Result<File> {
     let metadata = fs::metadata(&blob.original_path)?;
 
     // Use local file, it is not modified
-    let mut file = if metadata.created()? == blob.created && metadata.modified()? == blob.modified {
+    if metadata.created()? == blob.created && metadata.modified()? == blob.modified {
         tracing::trace!("local file unmodified, using original");
-        File::open(&blob.original_path).await?
+        Ok(File::open(&blob.original_path).await?)
     } else {
         tracing::trace!(
             "local file modified {} != {} retrieving new copy from cold storage",
@@ -318,9 +317,12 @@ async fn determine_file_type(ds: Arc<PgPool>, blob: &mut BlobDescription) -> Res
         tracing::trace!("status from bucket write {:?}", response);
 
         // file.seek(SeekFrom::Start(0))?;
-        file
-    };
+        Ok(file)
+    }
+}
 
+async fn determine_file_type(ds: Arc<PgPool>, blob: &mut BlobDescription) -> Result<()> {
+    let mut file = concentre_blob(blob).await?;
     let mut digest = Sha512::new();
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).await?;
@@ -348,7 +350,49 @@ WHERE
     .execute(&*ds)
     .await?;
 
-    dbg!(&blob);
+    summarize_pdf(ds, &blob.ulid).await?;
+
+    Ok(())
+}
+
+async fn retrieve_blob(ds: Arc<PgPool>, blob_id: &Ulid) -> Result<BlobDescription> {
+    let row = sqlx::query(r#"SELECT * FROM blobs WHERE ulid = $1"#)
+        .bind(blob_id.to_string())
+        .fetch_one(&*ds)
+        .await?;
+
+    let blob_json: serde_json::Value = row.try_get("data")?;
+    let mut blob: BlobDescription = serde_json::from_value(blob_json)?;
+    blob.ulid = Ulid::from_string(row.try_get("ulid")?)?;
+    blob.id = row.try_get("id")?;
+    Ok(blob)
+}
+
+async fn summarize_pdf(ds: Arc<PgPool>, blob_id: &Ulid) -> Result<()> {
+    tracing::trace!("summarize_pdf processing ...");
+
+    let blob = retrieve_blob(ds, blob_id).await?;
+    let mut file = concentre_blob(&blob).await?;
+
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await?;
+
+    let pdf = FileOptions::cached().load(buffer.as_slice()).unwrap();
+
+    if let Some(ref info) = pdf.trailer.info_dict {
+        let title = info.get("Title").and_then(|p| p.to_string_lossy().ok());
+        dbg!(&title);
+        let author = info.get("Author").and_then(|p| p.to_string_lossy().ok());
+        dbg!(&author);
+    }
+
+    for page in pdf.pages() {
+        let page = page?;
+        dbg!(&page);
+        if let Some(ref c) = page.contents {
+            tracing::trace!("{:?}", c);
+        }
+    }
 
     Ok(())
 }
