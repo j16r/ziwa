@@ -12,7 +12,6 @@ use anyhow::Result;
 use awscreds::Credentials;
 use awsregion::Region;
 use base64::{engine::general_purpose, Engine as _};
-use futures_util::TryStreamExt;
 use mime_sniffer::MimeTypeSniffer;
 use pdf::file::FileOptions;
 use rdkafka::config::ClientConfig;
@@ -33,16 +32,19 @@ use walkdir::WalkDir;
 
 use crate::rpc::{Command, Response};
 
-async fn run_consumer(ds: Arc<PgPool>) {
+async fn run_consumer(ctx: Arc<Context>) {
+    let topic = "ziwa.jobs";
+    let group_id = "ziwa.jobs";
+
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "0.0.0.0:9092")
-        .set("group.id", "dev")
+        .set("group.id", group_id)
         .set("enable.auto.commit", "false")
         .create()
         .expect("Consumer creation failed");
 
     consumer
-        .subscribe(&["jobs"])
+        .subscribe(&[topic])
         .expect("Can't subscribe to specified topic");
 
     loop {
@@ -52,7 +54,7 @@ async fn run_consumer(ds: Arc<PgPool>) {
             }
             Ok(message) => {
                 let message = message.detach();
-                process_message(ds.clone(), &message).await;
+                process_message(&ctx, &message).await;
                 consumer.commit_consumer_state(CommitMode::Async).unwrap();
             }
         }
@@ -65,84 +67,86 @@ async fn manage_ds(ds: Arc<PgPool>) -> Result<()> {
     Ok(())
 }
 
+struct Context {
+    queue: Arc<FutureProducer>,
+    store: Arc<PgPool>,
+}
+
 pub async fn run() -> Result<()> {
     tracing::trace!("connecting to surreal");
 
-    let ds = Arc::new(
+    let store = Arc::new(
         PgPoolOptions::new()
             .max_connections(5)
             .connect("postgres://ziwadev:ziwadevpass@localhost/ziwadev")
             .await?,
     );
 
-    let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", "0.0.0.0:9092")
-        .create()
-        .expect("Consumer creation failed");
-
-    producer
+    let queue: Arc<FutureProducer> = Arc::new(
+        ClientConfig::new()
+            .set("bootstrap.servers", "0.0.0.0:9092")
+            .create()
+            .expect("Consumer creation failed"),
+    );
+    queue
         .send(
-            FutureRecord::to("jobs").key("startup").payload(&vec![]),
+            FutureRecord::to("ziwa.jobs")
+                .key("startup")
+                .payload(&vec![]),
             Duration::from_secs(0),
         )
         .await
         .unwrap();
 
-    manage_ds(ds.clone()).await?;
-    tokio::spawn(run_consumer(ds));
+    let context = Arc::new(Context { store, queue });
+
+    manage_ds(context.store.clone()).await?;
+    tokio::spawn(run_consumer(context.clone()));
 
     let addr = ("127.0.0.1", 34982);
     tracing::trace!("starting server on: {}:{}", &addr.0, &addr.1);
     Server::build()
         .bind("control", addr, move || {
-            fn_service(move |mut stream: TcpStream| async move {
-                let mut len_input = 0_usize.to_be_bytes();
-                match stream.read_exact(&mut len_input).await {
-                    Ok(bytes_read) => {
-                        tracing::trace!("read bytes {:?}", bytes_read);
+            let queue = context.queue.clone();
+            fn_service(move |mut stream: TcpStream| {
+                let queue = queue.clone();
+
+                async move {
+                    let mut len_input = 0_usize.to_be_bytes();
+                    match stream.read_exact(&mut len_input).await {
+                        Ok(bytes_read) => {
+                            tracing::trace!("read bytes {:?}", bytes_read);
+                        }
+                        Err(err) => {
+                            tracing::error!("stream error: {:?}", err);
+                            return Err(());
+                        }
                     }
-                    Err(err) => {
-                        tracing::error!("stream error: {:?}", err);
-                        return Err(());
+
+                    let len = usize::from_be_bytes(len_input);
+                    let mut bytes = vec![0; len];
+                    match stream.read_exact(&mut bytes).await {
+                        Ok(bytes_read) => {
+                            tracing::trace!("read bytes {:?}", bytes_read);
+                        }
+                        Err(err) => {
+                            tracing::error!("stream error: {:?}", err);
+                            return Err(());
+                        }
                     }
+                    tracing::trace!("completed reading input from cli");
+
+                    let command: Command = bincode::deserialize(&bytes).unwrap();
+                    tracing::trace!("got command from cli {:?}", command);
+
+                    queue_job(queue, command).await.unwrap();
+
+                    let response = Response::Ok;
+                    let mut output = Cursor::new(bincode::serialize(&response).unwrap());
+                    stream.write_buf(&mut output).await.unwrap();
+
+                    Ok(())
                 }
-
-                let len = usize::from_be_bytes(len_input);
-                let mut bytes = vec![0; len];
-                match stream.read_exact(&mut bytes).await {
-                    Ok(bytes_read) => {
-                        tracing::trace!("read bytes {:?}", bytes_read);
-                    }
-                    Err(err) => {
-                        tracing::error!("stream error: {:?}", err);
-                        return Err(());
-                    }
-                }
-
-                tracing::trace!("completed reading input from cli");
-
-                let command: Command = bincode::deserialize(&bytes).unwrap();
-                tracing::trace!("got command from cli {:?}", command);
-
-                let producer: FutureProducer = ClientConfig::new()
-                    .set("bootstrap.servers", "0.0.0.0:9092")
-                    .create()
-                    .expect("Consumer creation failed");
-
-                let key = Ulid::new().to_string();
-                producer
-                    .send(
-                        FutureRecord::to("jobs").key(&key).payload(&bytes),
-                        Duration::from_secs(0),
-                    )
-                    .await
-                    .unwrap();
-
-                let response = Response::Ok;
-                let mut output = Cursor::new(bincode::serialize(&response).unwrap());
-                stream.write_buf(&mut output).await.unwrap();
-
-                Ok(())
             })
             .map_err(|err| tracing::error!("service error: {:?}", err))
         })?
@@ -153,29 +157,45 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn process_message(ds: Arc<PgPool>, msg: &rdkafka::message::OwnedMessage) {
+async fn queue_job(queue: Arc<FutureProducer>, job: Command) -> Result<()> {
+    let bytes = bincode::serialize(&job)?;
+
+    tracing::trace!("queuing new job {:#?}", &job);
+    let key = Ulid::new().to_string();
+    queue
+        .send(
+            FutureRecord::to("ziwa.jobs").key(&key).payload(&bytes),
+            Duration::from_secs(0),
+        )
+        .await
+        .unwrap();
+
+    Ok(())
+}
+
+async fn process_message(ctx: &Context, msg: &rdkafka::message::OwnedMessage) {
     if let Some(bytes) = msg.payload() {
         if bytes.is_empty() {
-            tracing::trace!("skipping empty message");
+            tracing::trace!("skipping empty message {:?}", msg);
             return;
         }
         let command: Command = bincode::deserialize(bytes).unwrap();
 
         tracing::trace!("got command from event source {:?}", command);
 
-        work(ds, &command).await;
+        work(ctx, &command).await;
     }
 }
 
-async fn work(ds: Arc<PgPool>, command: &Command) {
+async fn work(ctx: &Context, command: &Command) {
     tracing::info!("starting worker on {:?}", &command);
 
     let result = match command {
-        Command::ShutDown => {
-            unimplemented!();
-        }
-        Command::FilesAdd(path) => add_path(ds, path).await,
-        Command::SummarizePdf(ulid) => summarize_pdf(ds, ulid).await,
+        Command::ShutDown => unimplemented!(),
+        Command::FilesAdd(path) => add_path(ctx.store.clone(), ctx.queue.clone(), path).await,
+        Command::SummarizePdf(ulid) => summarize_pdf(ctx.store.clone(), ulid).await,
+        Command::Docker => unimplemented!(),
+        Command::Wasm => unimplemented!(),
     };
 
     match result {
@@ -200,47 +220,32 @@ struct BlobDescription {
     digest: Option<String>,
 }
 
-async fn add_path(ds: Arc<PgPool>, path: &Path) -> Result<()> {
-    tracing::trace!("add_path processing ...");
-    for entry in WalkDir::new(path).into_iter() {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
+impl std::fmt::Display for BlobDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.original_path)
+    }
+}
 
-        tracing::trace!("adding {:?}", entry);
+async fn add_path(ds: Arc<PgPool>, queue: Arc<FutureProducer>, path: &Path) -> Result<()> {
+    tracing::trace!("add_path processing {:?} ...", path);
 
-        let command = Command::FilesAdd(entry.path().to_path_buf());
-        sqlx::query(
-            r#"
-INSERT INTO jobs ( job, data )
-VALUES ( $1::job_type, $2 )
-RETURNING id
-        "#,
-        )
-        .bind(command.to_string())
-        .bind(Json(&command))
-        .fetch_one(&*ds)
-        .await?;
-
-        let metadata = fs::metadata(entry.path())?;
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() {
         let mut blob = BlobDescription {
             id: 0,
             ulid: Ulid::new(),
-            original_path: entry.path().to_path_buf(),
+            original_path: path.to_path_buf(),
             created: metadata.created()?,
             modified: metadata.modified()?,
             size: metadata.len(),
             mime_type: None,
             digest: None,
         };
-        let rec = sqlx::query(
-            r#"
-INSERT INTO blobs ( ulid, data )
-VALUES ( $1, $2 )
-RETURNING id
-        "#,
-        )
+        let rec = sqlx::query(concat!(
+            "INSERT INTO blobs ( ulid, data ) ",
+            "VALUES ( $1, $2 ) ",
+            "RETURNING id"
+        ))
         .bind(blob.ulid.to_string())
         .bind(Json(&blob))
         .fetch_one(&*ds)
@@ -248,6 +253,14 @@ RETURNING id
         blob.id = rec.try_get("id")?;
 
         fetch_file(ds.clone(), &mut blob).await?;
+        return Ok(());
+    }
+
+    for entry in WalkDir::new(path).min_depth(1).max_depth(1).into_iter() {
+        let entry = entry?;
+        tracing::trace!("adding {:?}", entry);
+        let command = Command::FilesAdd(entry.path().to_path_buf());
+        queue_job(queue.clone(), command).await?;
     }
 
     Ok(())
@@ -337,26 +350,19 @@ async fn determine_file_type(ds: Arc<PgPool>, blob: &mut BlobDescription) -> Res
 
     blob.mime_type = mime_type.map(|t| t.to_owned());
 
-    sqlx::query(
-        r#"
-UPDATE blobs
-SET DATA = $1
-WHERE
-    id = $2
-        "#,
-    )
-    .bind(Json(&blob))
-    .bind(blob.id)
-    .execute(&*ds)
-    .await?;
+    sqlx::query("UPDATE blobs SET DATA = $1 WHERE id = $2")
+        .bind(Json(&blob))
+        .bind(blob.id)
+        .execute(&*ds)
+        .await?;
 
     match &blob.mime_type {
         Some(s) => match s.as_ref() {
             "application/pdf" => summarize_pdf(ds.clone(), &blob.ulid).await?,
             "image/jpeg" => extract_exif(ds, &blob.ulid).await?,
             other => tracing::warn!("unrecognized file type {}", other),
-        }
-        None => {},
+        },
+        None => {}
     }
 
     Ok(())
@@ -413,9 +419,8 @@ async fn summarize_pdf(ds: Arc<PgPool>, blob_id: &Ulid) -> Result<()> {
 
     if let Some(ref info) = pdf.trailer.info_dict {
         let title = info.get("Title").and_then(|p| p.to_string_lossy().ok());
-        dbg!(&title);
         let author = info.get("Author").and_then(|p| p.to_string_lossy().ok());
-        dbg!(&author);
+        tracing::trace!("pdf {} has title: {:?} author {:?}", blob, title, author);
     }
 
     for page in pdf.pages() {

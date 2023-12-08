@@ -2,6 +2,7 @@ use std::io;
 use std::path::Path;
 
 use clap::{arg, Command};
+use tracing_subscriber::EnvFilter;
 
 mod client;
 mod rpc;
@@ -9,7 +10,14 @@ mod server;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .event_format(
+            tracing_subscriber::fmt::format()
+                .with_file(true)
+                .with_line_number(true),
+        )
+        .init();
 
     let matches = Command::new("ziwa")
         .version("1.0")
@@ -19,11 +27,13 @@ async fn main() -> io::Result<()> {
         .subcommand(
             Command::new("server")
                 .about("Server commands")
+                .arg_required_else_help(true)
                 .subcommand(Command::new("run").about("Run the server")),
         )
         .subcommand(
             Command::new("files")
                 .about("Manage files in the lake")
+                .arg_required_else_help(true)
                 .subcommand(
                     Command::new("add")
                         .about("Add files to the lake")

@@ -10,6 +10,8 @@ pub enum Command {
     ShutDown,
     FilesAdd(PathBuf),
     SummarizePdf(Ulid),
+    Docker,
+    Wasm,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
