@@ -10,3 +10,7 @@ Ziwa is a knowledge storage and transformation engine.
   * Lake - The collection of all files, can be added to.
   * Processor - Is a recipe for how to take an input and produce an output.
   * Route - Takes a filter and creates jobs any time a Blob is added.
+
+## Use Cases
+
+

@@ -37,6 +37,7 @@ tokio-uring = { version = "0.4", optional = true }
 
 mime-sniffer = "0.1.2"
 pdf = "0.8.1"
+epub = "1.2.2"
 kamadak-exif = "0.5.5"
 
 aws-creds = "0.34"
@@ -62,3 +63,6 @@ tracing-subscriber = { version = "*", features = ["env-filter"] }
 ulid = { version = "*", features = ["serde"] }
 
 walkdir = "*"
+async-trait = "*"
+# zip = "0.6.6"
+async_zip = { version = "0.0.16", features = ["full"] }

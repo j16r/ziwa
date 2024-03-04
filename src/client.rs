@@ -1,17 +1,39 @@
+use std::collections::HashMap;
 use std::io;
-
 use std::path::Path;
 
 use actix_rt::net::TcpStream;
 use bytes::BytesMut;
 
-use crate::rpc::{Command, Response};
+use crate::rpc::{Command, CommandName, Response};
 
 pub async fn add(path: &Path) -> io::Result<()> {
-    tracing::info!("adding path: {:?}", &path);
+    let command = Command {
+        name: CommandName::FilesAdd,
+        inputs: HashMap::from([("path".to_string(), path.to_string_lossy().into())]),
+    };
+    // (path.to_path_buf());
+    send_command(&command).await
+}
 
+pub async fn reset() -> io::Result<()> {
+    let command = Command {
+        name: CommandName::Reset,
+        inputs: HashMap::default(),
+    };
+    send_command(&command).await
+}
+
+pub async fn shutdown() -> io::Result<()> {
+    let command = Command {
+        name: CommandName::ShutDown,
+        inputs: HashMap::default(),
+    };
+    send_command(&command).await
+}
+
+async fn send_command(command: &Command) -> io::Result<()> {
     let stream = TcpStream::connect("127.0.0.1:34982").await?;
-    let command = Command::FilesAdd(path.to_path_buf());
 
     let output = bincode::serialize(&command).unwrap();
     let len_output = output.len().to_be_bytes();

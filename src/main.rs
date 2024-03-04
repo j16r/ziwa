@@ -28,7 +28,16 @@ async fn main() -> io::Result<()> {
             Command::new("server")
                 .about("Server commands")
                 .arg_required_else_help(true)
-                .subcommand(Command::new("run").about("Run the server")),
+                .subcommand(Command::new("run").about("Run the server"))
+                .subcommand(Command::new("shutdown").about("Shut down the server")),
+        )
+        .subcommand(
+            Command::new("debug")
+                .about("Debug commands")
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("reset").about("Complete irreversible reseet, all data wiped"),
+                ),
         )
         .subcommand(
             Command::new("files")
@@ -36,6 +45,7 @@ async fn main() -> io::Result<()> {
                 .arg_required_else_help(true)
                 .subcommand(
                     Command::new("add")
+                        .arg_required_else_help(true)
                         .about("Add files to the lake")
                         .arg(arg!(<PATH> "path where file or files live")),
                 ),
@@ -47,11 +57,17 @@ async fn main() -> io::Result<()> {
             if let Err(e) = server::run().await {
                 tracing::error!("error running server {}", e);
             }
+        } else if let Some(_subcommand) = subcommand.subcommand_matches("shutdown") {
+            client::shutdown().await?;
         }
     } else if let Some(subcommand) = matches.subcommand_matches("files") {
         if let Some(subcommand) = subcommand.subcommand_matches("add") {
             let path = subcommand.get_one::<String>("PATH").unwrap();
             client::add(Path::new(path)).await?;
+        }
+    } else if let Some(subcommand) = matches.subcommand_matches("debug") {
+        if let Some(_subcommand) = subcommand.subcommand_matches("reset") {
+            client::reset().await?;
         }
     }
 
